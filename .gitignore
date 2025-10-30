@@ -2,3 +2,7 @@
 .env
 __pycache__/
 *.pyc
+
+# Ignore Chroma DB storage (local vector DB files)
+chroma_fcc_storage/
+VectordB/chroma_fcc_storage/
