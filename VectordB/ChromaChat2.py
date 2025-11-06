@@ -53,6 +53,7 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 SERPAPI_API_KEY = os.getenv("SERPAPI_KEY") or os.getenv("SERPAPI_API_KEY")
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
 PINECONE_INDEX = os.getenv("PINECONE_INDEX", "fcc-chatbot-index")
+ID_STRATEGY = os.getenv("PINECONE_ID_STRATEGY", "url")  # 'url' (default) or 'content'
 
 # Override with Streamlit secrets if available (for cloud deployment)
 if STREAMLIT_AVAILABLE:
@@ -95,7 +96,7 @@ EMERGENCY_TOPICS = [
 ]
 
 # Ingestion-like params for saving external sources
-MIN_ARTICLE_LENGTH = 300
+MIN_ARTICLE_LENGTH = 200
 CHUNK_SIZE = 2000
 CHUNK_OVERLAP = 200
 
@@ -215,7 +216,12 @@ def retrieve_relevant_chunks(query: str, top_k: int = SIMILARITY_TOP_K) -> List[
         )
         
         chunks = []
-        for match in results.get('matches', []):
+        matches = []
+        if isinstance(results, dict):
+            matches = results.get('matches', [])
+        else:
+            matches = getattr(results, 'matches', []) or []
+        for match in matches:
             metadata = match.get('metadata', {})
             text = metadata.get('text', '')
             
@@ -234,6 +240,7 @@ def retrieve_relevant_chunks(query: str, top_k: int = SIMILARITY_TOP_K) -> List[
 
 def external_search(query: str, max_results: int = 3) -> List[Dict]:
     if not SERPAPI_API_KEY:
+        print("ℹ️ SERPAPI_API_KEY not set; skipping external web search.")
         return []
 
     params = {
@@ -260,40 +267,102 @@ def external_search(query: str, max_results: int = 3) -> List[Dict]:
     return external
 
 def fetch_full_text(url: str) -> str:
+    """Fetch best-effort readable text from a URL.
+    Uses a realistic User-Agent and attempts multiple selectors before falling back to <p> tags.
+    """
     try:
         import requests
         from bs4 import BeautifulSoup
 
-        resp = requests.get(url, timeout=10)
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0 Safari/537.36"
+            )
+        }
+        resp = requests.get(url, headers=headers, timeout=12)
         resp.raise_for_status()
         soup = BeautifulSoup(resp.text, "html.parser")
-        return "\n".join(p.get_text().strip() for p in soup.find_all("p"))
+
+        # Try common article/content containers first
+        candidates = []
+        for selector in [
+            "article",
+            "div.article",
+            "div.post",
+            "div#content",
+            "main",
+            "div.content",
+        ]:
+            node = soup.select_one(selector)
+            if node:
+                text = "\n".join(p.get_text().strip() for p in node.find_all(["p", "li"]))
+                if len(text) >= 150:
+                    candidates.append(text)
+
+        if candidates:
+            # Pick the longest candidate
+            best = max(candidates, key=len)
+            return best
+
+        # Fallback: all paragraphs on the page
+        fallback = "\n".join(p.get_text().strip() for p in soup.find_all("p"))
+        return fallback
     except Exception:
         return ""
 
-def generate_doc_id(url: str, chunk_index: int) -> str:
-    """Generate unique ID for document chunk"""
-    # Create hash of URL for shorter IDs
-    url_hash = hashlib.md5(url.encode()).hexdigest()[:8]
-    return f"web_{url_hash}_chunk_{chunk_index:03d}"
+def generate_doc_id(url: str, chunk_index: int, chunk_text: str | None = None) -> str:
+    """Generate an ID for a document chunk.
+    Strategies:
+      - url (default): stable per URL and chunk index -> overwrites on repeat runs
+      - content: based on the chunk content -> treats new content as a new vector
+    """
+    try:
+        if ID_STRATEGY.lower() == "content" and chunk_text:
+            ch = hashlib.md5(chunk_text.encode()).hexdigest()[:12]
+            return f"webc_{ch}"
+        # Fallback/default: URL-based stable IDs
+        url_hash = hashlib.md5(url.encode()).hexdigest()[:8]
+        return f"web_{url_hash}_chunk_{chunk_index:03d}"
+    except Exception:
+        # Last resort: random-like but deterministic per input
+        base = (url or "") + "|" + str(chunk_index) + "|" + (chunk_text or "")
+        h = hashlib.md5(base.encode()).hexdigest()[:12]
+        return f"web_{h}"
 
 def save_external_docs_to_pinecone(external_docs: List[Dict]) -> int:
-    """Save external docs to Pinecone as chunks with embeddings. Returns count of vectors added."""
+    """Save external docs to Pinecone as chunks with embeddings.
+    Returns the count of vectors that were actually upserted (new or updated) according to Pinecone response.
+    """
     vectors_to_upsert = []
 
     for d in external_docs:
         url = d.get("url", "")
         title = d.get("title", "External Source")
         content = d.get("content", "")
-        if not url or not content or len(content) < MIN_ARTICLE_LENGTH:
+
+        if not url:
+            # Skip if no URL (shouldn't happen)
             continue
+
+        # If we failed to fetch full text and only have a short snippet, still allow if it's reasonably informative
+        if not content or len(content.strip()) < MIN_ARTICLE_LENGTH:
+            # Try to enrich minimal content with title context before skipping
+            combined = (title + "\n\n" + (content or "")).strip()
+            if len(combined) >= MIN_ARTICLE_LENGTH:
+                content = combined
+            else:
+                # Debug hint in CLI
+                print(f"ℹ️ Skipping (short/empty): {url}")
+                continue
 
         chunks = chunk_text(content)
         embeddings = embed_texts(chunks)
 
         today = str(datetime.date.today())
         for idx, (chunk, emb) in enumerate(zip(chunks, embeddings)):
-            doc_id = generate_doc_id(url, idx)
+            doc_id = generate_doc_id(url, idx, chunk)
             vector = {
                 'id': doc_id,
                 'values': emb,
@@ -309,12 +378,18 @@ def save_external_docs_to_pinecone(external_docs: List[Dict]) -> int:
 
     if vectors_to_upsert:
         try:
-            # Upload in batches of 100
+            # Upload in batches of 100 and sum upserted counts
             batch_size = 100
+            upserted_total = 0
             for i in range(0, len(vectors_to_upsert), batch_size):
                 batch = vectors_to_upsert[i:i + batch_size]
-                pinecone_index.upsert(vectors=batch)
-            return len(vectors_to_upsert)
+                resp = pinecone_index.upsert(vectors=batch)
+                # Support both dict-like and object-like responses
+                if isinstance(resp, dict):
+                    upserted_total += int(resp.get('upserted_count', 0))
+                else:
+                    upserted_total += int(getattr(resp, 'upserted_count', 0))
+            return upserted_total
         except Exception as e:
             print(f"⚠️ Failed saving external docs to Pinecone: {e}")
             return 0
@@ -374,9 +449,9 @@ def build_prompt(query: str,
         "- Cite sources using the format: 'According to [document/source]...'\n"
         "- Provide examples and context when helpful\n"
         "- List all sources at the end under '📚 Sources:' with markdown links\n"
-        "- If context is insufficient, supplement with your knowledge but indicate this clearly"
+        
     )
-
+    #- If context is insufficient, supplement with your knowledge but indicate this clearly"
     parts = []
 
     for chunk in embedded_chunks:
@@ -457,15 +532,16 @@ def chat():
                 before_stats = pinecone_index.describe_index_stats()
                 before_cnt = before_stats.total_vector_count
                 
-                added = save_external_docs_to_pinecone(external_docs)
+                _ = save_external_docs_to_pinecone(external_docs)
                 
-                if added > 0:
-                    time_module.sleep(1)  # Brief pause for index to update
-                    after_stats = pinecone_index.describe_index_stats()
-                    after_cnt = after_stats.total_vector_count
-                    print(f"✅ Added {added} embeddings to Pinecone. Total now: {after_cnt}")
-                else:
-                    print(f"ℹ️ No new embeddings added. Total remains: {before_cnt}")
+                # Brief pause for index stats to catch up
+                time_module.sleep(2)
+                after_stats = pinecone_index.describe_index_stats()
+                after_cnt = after_stats.total_vector_count
+                new_added = 0
+                if before_cnt is not None and after_cnt is not None:
+                    new_added = max(after_cnt - before_cnt, 0)
+                print(f"✅ Added {new_added} new embeddings. Pinecone total: {after_cnt}")
             except Exception as e:
                 print(f"⚠️ Error while saving external sources to Pinecone: {e}")
 

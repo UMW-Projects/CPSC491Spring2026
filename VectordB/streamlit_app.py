@@ -35,6 +35,7 @@ load_dotenv()
 PERSIST_PATH = str(ROOT / "chroma_fcc_storage")
 COLLECTION_NAME = "fcc_documents"
 EMBED_MODEL = "text-embedding-3-small"
+EMBED_DIMENSIONS = 1536
 SIMILARITY_TOP_K = 5
 MAX_RESPONSE_TOKENS = 500
 FALLBACK_TEXT = "No information available in the dataset or external sources for that question."
@@ -46,6 +47,7 @@ SERPAPI_API_KEY = os.getenv("SERPAPI_KEY") or os.getenv("SERPAPI_API_KEY")
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
 PINECONE_INDEX = os.getenv("PINECONE_INDEX") or os.getenv("PINECONE_INDEX_NAME") or "fcc-chatbot-index"
 USE_PINECONE = True  # default to Pinecone per user request
+ID_STRATEGY = os.getenv("PINECONE_ID_STRATEGY", "url")  # 'url' (default) or 'content'
 
 # Override with Streamlit secrets if available
 try:
@@ -96,6 +98,117 @@ from ChromaChat2 import (
 )
 
 # === Helper Functions ===
+
+MIN_ARTICLE_LENGTH = 200
+CHUNK_SIZE = 2000
+CHUNK_OVERLAP = 200
+
+def chunk_text(text: str, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) -> List[str]:
+    if len(text) <= chunk_size:
+        return [text]
+    chunks: List[str] = []
+    start = 0
+    while start < len(text):
+        end = min(start + chunk_size, len(text))
+        chunks.append(text[start:end])
+        if end == len(text):
+            break
+        start = end - overlap
+    return chunks
+
+def embed_texts(texts: List[str]) -> List[List[float]]:
+    if not texts:
+        return []
+    resp = openai_client.embeddings.create(
+        model=EMBED_MODEL,
+        input=texts,
+        dimensions=EMBED_DIMENSIONS,
+    )
+    return [r.embedding for r in resp.data]
+
+def generate_doc_id(url: str, chunk_index: int, chunk_text: str | None = None) -> str:
+    """Generate an ID for a document chunk.
+    Strategies:
+      - url (default): stable per URL and chunk index -> overwrites on repeat runs
+      - content: based on the chunk content -> treats new content as a new vector
+    """
+    import hashlib as _hashlib
+    try:
+        if ID_STRATEGY.lower() == "content" and chunk_text:
+            ch = _hashlib.md5(chunk_text.encode()).hexdigest()[:12]
+            return f"webc_{ch}"
+        # Fallback/default: URL-based stable IDs
+        url_hash = _hashlib.md5(url.encode()).hexdigest()[:8]
+        return f"web_{url_hash}_chunk_{chunk_index:03d}"
+    except Exception:
+        base = (url or "") + "|" + str(chunk_index) + "|" + (chunk_text or "")
+        h = _hashlib.md5(base.encode()).hexdigest()[:12]
+        return f"web_{h}"
+
+def save_external_docs_to_pinecone(external_docs: List[Dict]) -> int:
+    """Save external docs to Pinecone as chunks with embeddings.
+    Returns the count of vectors that were actually upserted (new or updated) according to Pinecone response.
+    """
+    if not (USE_PINECONE and pinecone_index is not None):
+        return 0
+    vectors_to_upsert = []
+
+    import datetime as _dt
+    today = str(_dt.date.today())
+
+    for d in external_docs:
+        url = d.get("url", "")
+        title = d.get("title", "External Source")
+        content = d.get("content", "")
+
+        if not url:
+            continue
+
+        if not content or len(content.strip()) < MIN_ARTICLE_LENGTH:
+            combined = (title + "\n\n" + (content or "")).strip()
+            if len(combined) >= MIN_ARTICLE_LENGTH:
+                content = combined
+            else:
+                # Hint in sidebar for transparency
+                st.sidebar.info(f"Skipping short/empty: {url}")
+                continue
+
+        chunks = chunk_text(content)
+        embeddings = embed_texts(chunks)
+
+        for idx, (chunk, emb) in enumerate(zip(chunks, embeddings)):
+            doc_id = generate_doc_id(url, idx, chunk)
+            vectors_to_upsert.append({
+                'id': doc_id,
+                'values': emb,
+                'metadata': {
+                    'text': chunk[:1000],
+                    'source': url,
+                    'title': title,
+                    'retrieved': today,
+                    'chunk_index': idx,
+                }
+            })
+
+    if not vectors_to_upsert:
+        return 0
+
+    # Upsert in batches
+    upserted_total = 0
+    batch_size = 100
+    try:
+        for i in range(0, len(vectors_to_upsert), batch_size):
+            batch = vectors_to_upsert[i:i + batch_size]
+            resp = pinecone_index.upsert(vectors=batch)
+            if isinstance(resp, dict):
+                upserted_total += int(resp.get('upserted_count', 0))
+            else:
+                upserted_total += int(getattr(resp, 'upserted_count', 0))
+    except Exception as e:
+        st.sidebar.warning(f"⚠️ Failed saving to Pinecone: {e}")
+        return 0
+
+    return upserted_total
 
 def _retrieve_from_chroma(query: str, top_k: int = SIMILARITY_TOP_K) -> List[Dict]:
     q_emb = embed_text(query)
@@ -286,17 +399,27 @@ def main():
                             if full:
                                 d["content"] = full
                         
-                        # Save external docs only when using Chroma locally
-                        if not USE_PINECONE and collection is not None:
-                            try:
+                        # Save external docs to the active backend
+                        try:
+                            if USE_PINECONE and pinecone_index is not None:
+                                before_stats = pinecone_index.describe_index_stats()
+                                before_cnt = before_stats.get("total_vector_count") if isinstance(before_stats, dict) else getattr(before_stats, "total_vector_count", None)
+                                _ = save_external_docs_to_pinecone(external_docs)
+                                time.sleep(2)
+                                after_stats = pinecone_index.describe_index_stats()
+                                after_cnt = after_stats.get("total_vector_count") if isinstance(after_stats, dict) else getattr(after_stats, "total_vector_count", None)
+                                new_added = 0
+                                if before_cnt is not None and after_cnt is not None:
+                                    new_added = max(after_cnt - before_cnt, 0)
+                                st.sidebar.success(f"✅ Added {new_added} new embeddings. Pinecone total: {after_cnt:,}")
+                            elif collection is not None:
                                 before_cnt = collection.count()
                                 save_external_docs_to_chroma(external_docs)
                                 after_cnt = collection.count()
-                                added = after_cnt - before_cnt
-                                if added > 0:
-                                    st.sidebar.success(f"✅ Added {added} embeddings. Total: {after_cnt:,}")
-                            except Exception as e:
-                                st.sidebar.warning(f"⚠️ Could not save external docs: {e}")
+                                added = max(after_cnt - before_cnt, 0)
+                                st.sidebar.success(f"✅ Added {added} new embeddings. Chroma total: {after_cnt:,}")
+                        except Exception as e:
+                            st.sidebar.warning(f"⚠️ Could not save external docs: {e}")
                         
                         if not embedded_chunks and not external_docs:
                             response_text = FALLBACK_TEXT
