@@ -14,9 +14,13 @@ if str(ROOT) not in sys.path:
 import os
 import time
 import streamlit as st
-from chromadb import PersistentClient
 from openai import OpenAI
 from dotenv import load_dotenv
+try:
+    from pinecone import Pinecone
+except Exception:
+    Pinecone = None
+from typing import List, Dict
 
 try:
     from serpapi import GoogleSearch
@@ -26,8 +30,8 @@ except ImportError:
 # Load environment variables
 load_dotenv()
 
-# === Configuration - Use correct paths ===
-# Point to the root-level chroma_fcc_storage
+# === Configuration ===
+# Chroma (legacy/local) paths kept for optional local runs
 PERSIST_PATH = str(ROOT / "chroma_fcc_storage")
 COLLECTION_NAME = "fcc_documents"
 EMBED_MODEL = "text-embedding-3-small"
@@ -39,19 +43,45 @@ RELEVANCE_THRESHOLD = 0.35
 # API Keys
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 SERPAPI_API_KEY = os.getenv("SERPAPI_KEY") or os.getenv("SERPAPI_API_KEY")
+PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
+PINECONE_INDEX = os.getenv("PINECONE_INDEX") or os.getenv("PINECONE_INDEX_NAME") or "fcc-chatbot-index"
+USE_PINECONE = True  # default to Pinecone per user request
 
 # Override with Streamlit secrets if available
 try:
     if hasattr(st, 'secrets') and st.secrets:
         OPENAI_API_KEY = st.secrets.get("OPENAI_API_KEY", OPENAI_API_KEY)
         SERPAPI_API_KEY = st.secrets.get("SERPAPI_KEY", st.secrets.get("SERPAPI_API_KEY", SERPAPI_API_KEY))
+        PINECONE_API_KEY = st.secrets.get("PINECONE_API_KEY", PINECONE_API_KEY)
+        PINECONE_INDEX = st.secrets.get("PINECONE_INDEX", st.secrets.get("PINECONE_INDEX_NAME", PINECONE_INDEX))
+        USE_PINECONE = st.secrets.get("USE_PINECONE", USE_PINECONE)
 except:
     pass
 
 # Initialize clients
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
-chroma_client = PersistentClient(path=PERSIST_PATH)
-collection = chroma_client.get_or_create_collection(name=COLLECTION_NAME)
+
+# Pinecone client (preferred)
+pc = None
+pinecone_index = None
+if USE_PINECONE and PINECONE_API_KEY and Pinecone is not None:
+    try:
+        pc = Pinecone(api_key=PINECONE_API_KEY)
+        pinecone_index = pc.Index(PINECONE_INDEX)
+    except Exception as e:
+        pinecone_index = None
+        st.sidebar.warning(f"⚠️ Pinecone init failed: {e}. Falling back to Chroma (local).")
+
+# Fallback Chroma client (local only)
+collection = None
+if pinecone_index is None:
+    try:
+        from chromadb import PersistentClient  # defer import until needed
+        chroma_client = PersistentClient(path=PERSIST_PATH)
+        collection = chroma_client.get_or_create_collection(name=COLLECTION_NAME)
+        USE_PINECONE = False
+    except Exception as e:
+        st.error(f"❌ Neither Pinecone nor Chroma could be initialized: {e}")
 
 # Import helper functions from ChromaChat2
 sys.path.insert(0, str(ROOT / "VectordB"))
@@ -67,8 +97,7 @@ from ChromaChat2 import (
 
 # === Helper Functions ===
 
-def retrieve_relevant_chunks(query: str, top_k: int = SIMILARITY_TOP_K):
-    """Retrieve relevant chunks from ChromaDB"""
+def _retrieve_from_chroma(query: str, top_k: int = SIMILARITY_TOP_K) -> List[Dict]:
     q_emb = embed_text(query)
     res = collection.query(
         query_embeddings=[q_emb],
@@ -78,6 +107,29 @@ def retrieve_relevant_chunks(query: str, top_k: int = SIMILARITY_TOP_K):
     docs = res.get("documents", [[]])[0]
     metas = res.get("metadatas", [[]])[0]
     return [{"document": doc, "metadata": meta} for doc, meta in zip(docs, metas)]
+
+def _retrieve_from_pinecone(query: str, top_k: int = SIMILARITY_TOP_K) -> List[Dict]:
+    q_emb = embed_text(query)
+    results = pinecone_index.query(vector=q_emb, top_k=top_k, include_metadata=True)
+    matches = results.get("matches", []) if isinstance(results, dict) else results.matches
+    chunks = []
+    for m in matches:
+        md = m.get("metadata", {}) if isinstance(m, dict) else getattr(m, "metadata", {})
+        text = md.get("text") or md.get("chunk") or md.get("document") or ""
+        meta = {
+            "title": md.get("title", "Pinecone Document"),
+            "source": md.get("source") or md.get("url") or "",
+        }
+        if text:
+            chunks.append({"document": text, "metadata": meta})
+    return chunks
+
+def retrieve_relevant_chunks(query: str, top_k: int = SIMILARITY_TOP_K) -> List[Dict]:
+    if USE_PINECONE and pinecone_index is not None:
+        return _retrieve_from_pinecone(query, top_k)
+    if collection is not None:
+        return _retrieve_from_chroma(query, top_k)
+    return []
 
 def save_external_docs_to_chroma(external_docs):
     """Save external docs to ChromaDB"""
@@ -160,12 +212,23 @@ def main():
     # Sidebar with stats
     with st.sidebar:
         st.header("📊 System Stats")
-        try:
-            initial_count = collection.count()
-            st.success(f"**ChromaDB Embeddings:** {initial_count:,}")
-            st.info(f"**Database Path:** `{PERSIST_PATH}`")
-        except Exception as e:
-            st.error(f"⚠️ ChromaDB Error: {e}")
+        if USE_PINECONE and pinecone_index is not None:
+            st.success(f"Using Pinecone index: {PINECONE_INDEX}")
+            # Optional: try to get stats if supported
+            try:
+                stats = pinecone_index.describe_index_stats()
+                total_vecs = stats.get("total_vector_count") if isinstance(stats, dict) else getattr(stats, "total_vector_count", None)
+                if total_vecs is not None:
+                    st.info(f"Vectors: {total_vecs:,}")
+            except Exception:
+                pass
+        else:
+            try:
+                initial_count = collection.count()
+                st.success(f"**ChromaDB Embeddings:** {initial_count:,}")
+                st.info(f"**Database Path:** `{PERSIST_PATH}`")
+            except Exception as e:
+                st.error(f"⚠️ ChromaDB Error: {e}")
         
         st.markdown("---")
         st.markdown("### 💡 Tips")
@@ -223,16 +286,17 @@ def main():
                             if full:
                                 d["content"] = full
                         
-                        # Save external docs to ChromaDB
-                        try:
-                            before_cnt = collection.count()
-                            save_external_docs_to_chroma(external_docs)
-                            after_cnt = collection.count()
-                            added = after_cnt - before_cnt
-                            if added > 0:
-                                st.sidebar.success(f"✅ Added {added} embeddings. Total: {after_cnt:,}")
-                        except Exception as e:
-                            st.sidebar.warning(f"⚠️ Could not save external docs: {e}")
+                        # Save external docs only when using Chroma locally
+                        if not USE_PINECONE and collection is not None:
+                            try:
+                                before_cnt = collection.count()
+                                save_external_docs_to_chroma(external_docs)
+                                after_cnt = collection.count()
+                                added = after_cnt - before_cnt
+                                if added > 0:
+                                    st.sidebar.success(f"✅ Added {added} embeddings. Total: {after_cnt:,}")
+                            except Exception as e:
+                                st.sidebar.warning(f"⚠️ Could not save external docs: {e}")
                         
                         if not embedded_chunks and not external_docs:
                             response_text = FALLBACK_TEXT
