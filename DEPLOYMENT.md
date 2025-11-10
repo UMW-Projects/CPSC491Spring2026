@@ -29,15 +29,24 @@ AI-powered chat assistant for emergency alert systems, public safety communicati
    ```toml
    OPENAI_API_KEY = "your-openai-api-key-here"
    SERPAPI_KEY = "your-serpapi-key-here"
+   # Enable Pinecone (recommended for cloud persistence)
+   USE_PINECONE = true
+   PINECONE_API_KEY = "your-pinecone-api-key-here"
+   PINECONE_INDEX = "fcc-chatbot-index"
    ```
 
 5. **Deploy**
    - Click "Deploy!"
    - Wait for the app to build and launch
 
-### ⚠️ Important Note about ChromaDB
+### ⚠️ Important Note about Storage (Chroma vs Pinecone)
 
-The app requires the `chroma_fcc_storage` database with embeddings. On Streamlit Cloud, you have two options:
+By default this app can run in two modes:
+
+- Pinecone (recommended): uses a hosted vector DB (set `USE_PINECONE=true`).
+- Chroma (fallback/local): uses `chroma_fcc_storage` bundled in the repo.
+
+If you choose Chroma on Streamlit Cloud, you have two options:
 
 **Option 1: Include ChromaDB in Git (Recommended for small DBs < 100MB)**
 - Remove `chroma_fcc_storage/` from `.gitignore`
