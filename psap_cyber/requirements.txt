@@ -1,0 +1,5 @@
+# install alongside root: pip install -r requirements.txt -r psap_cyber/requirements.txt
+requests>=2.31.0
+pypdf>=4.0.0
+beautifulsoup4>=4.12.0
+streamlit>=1.28.0
