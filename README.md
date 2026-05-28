@@ -1,5 +1,18 @@
-# Generalized Fine-Tuning Repo
+# Emergency Alerting System — RAG Pipeline & AI Chatbot
+
+[![Research](https://img.shields.io/badge/NCUR_2026-Presented-4F46E5?style=for-the-badge&logo=academia&logoColor=white)](https://aialo.io)
+[![GitHub](https://img.shields.io/badge/GitHub-UMW--Projects-181717?style=for-the-badge&logo=github)](https://github.com/UMW-Projects/CPSC491Spring2026)
+[![Python](https://img.shields.io/badge/Python-3776AB?style=for-the-badge&logo=python&logoColor=white)](https://python.org)
+[![Pinecone](https://img.shields.io/badge/Pinecone-000000?style=for-the-badge&logo=pinecone&logoColor=white)](https://pinecone.io)
+[![ChromaDB](https://img.shields.io/badge/ChromaDB-orange?style=for-the-badge)](https://trychroma.com)
+[![Streamlit](https://img.shields.io/badge/Streamlit-FF4B4B?style=for-the-badge&logo=streamlit&logoColor=white)](https://streamlit.io)
+[![OpenAI](https://img.shields.io/badge/OpenAI-412991?style=for-the-badge&logo=openai&logoColor=white)](https://openai.com)
+[![Portfolio](https://img.shields.io/badge/Portfolio-aialo.io-C9A84C?style=for-the-badge&logo=google-chrome&logoColor=white)](https://aialo.io)
+
 > Intelligent Q&A, retrieval-augmented generation (RAG), and fine‑tuning pipeline for public safety / emergency alert system content.
+
+**Presented at the National Conference on Undergraduate Research (NCUR) 2026, Richmond, VA**
+**Built by [Aloysious Kabonge](https://aialo.io) and teammates — University of Mary Washington**
 
 ## 1. Overview
 
